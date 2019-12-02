@@ -4,6 +4,8 @@ using Microsoft.VisualStudio.Services.WebApi;
 using SharpSvn;
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Linq;
 using System.Threading.Tasks;
 
 namespace SvnCITrigger
@@ -51,7 +53,7 @@ namespace SvnCITrigger
 
             }
 
-            SortedList<int, BuildDefinition> buildIsNeeded = new SortedList<int, BuildDefinition>();
+            SortedList<int, RequiredBuildDetails> buildIsNeeded = new SortedList<int, RequiredBuildDetails>();
 
 
             foreach (BuildDefinition buildDef in buildDefinitions)
@@ -69,9 +71,7 @@ namespace SvnCITrigger
                         if (buildDef.Variables.TryGetValue("buildOrder", out bvBuildOrder))
                         {
                             buildOrder = Convert.ToInt32(bvBuildOrder.Value);
-
                         }
-
                     }
 
                     if (buildDef.Variables.ContainsKey("buildCI"))
@@ -80,73 +80,166 @@ namespace SvnCITrigger
                         if (buildDef.Variables.TryGetValue("buildCI", out bvBuildCi))
                         {
                             ignoreDefintion = !Convert.ToBoolean(bvBuildCi.Value);
-
                         }
                     }
 
                     if (!ignoreDefintion)
                     {
-                        long lastRepositoryVersion = GetLatestCheckinVersion(buildDef.Repository.Id, buildDef.Repository.DefaultBranch);
+                        Uri serverUrl = buildDef.Repository.Url;
+
+                        if (!serverUrl.AbsolutePath.EndsWith("/")) // Add a trailing slash if the URL doesn't end with one
+                        {
+                            UriBuilder builder = new UriBuilder(serverUrl);
+                            builder.Path += "/";
+                            serverUrl = builder.Uri;
+                        }
+
+                        ContinuousIntegrationTrigger ciTrigger = buildDef.Triggers.OfType<ContinuousIntegrationTrigger>().FirstOrDefault();
+
+                        List<string> branches;
+
+                        if (ciTrigger?.PathFilters == null || !ciTrigger.PathFilters.Any())
+                        {
+                            branches = new List<string> { buildDef.Repository.DefaultBranch };
+                        }
+                        else
+                        {
+                            branches = GetBranches(serverUrl, ciTrigger.PathFilters);
+                        }
+
+                        RequiredBuildDetails requiredBuildDetails = new RequiredBuildDetails
+                        {
+                            BuildDef = buildDef
+                        };
 
                         // get last version from builds
-                        Task<List<Microsoft.TeamFoundation.Build.WebApi.Build>> taskBuildList = Task.Run(() => buildClient.GetBuildsAsync(projectName, new List<int> { buildDef.Id }));
+                        Task<List<Build>> taskBuildList = Task.Run(() => buildClient.GetBuildsAsync(projectName, new List<int> { buildDef.Id }));
                         taskBuildList.Wait();
 
-                        Microsoft.TeamFoundation.Build.WebApi.Build latestBuild = taskBuildList.Result[0] as Microsoft.TeamFoundation.Build.WebApi.Build;
-                        if (latestBuild != null)
+                        foreach (string branch in branches)
                         {
-                            if (Convert.ToInt64(latestBuild.SourceVersion) < lastRepositoryVersion)
+                            long lastRepositoryVersion = GetLatestCheckinVersion(serverUrl, branch);
+
+                            Build latestBuild = taskBuildList.Result.FirstOrDefault(b => b.SourceBranch == branch);
+                            long lastBuildVersion = Convert.ToInt64(latestBuild?.SourceVersion);
+
+                            if (lastBuildVersion < lastRepositoryVersion)
                             {
-                                Console.WriteLine(string.Format("Build is required for {0} - last built version {1} last checkin version {2}", buildDef.Name, latestBuild.SourceVersion, lastRepositoryVersion));
-                                buildIsNeeded.Add(buildOrder, buildDef);
+                                Console.WriteLine($"Build is required for {buildDef.Name} (branch {branch}) - last built version {lastBuildVersion} last checkin version {lastRepositoryVersion}");
+                                requiredBuildDetails.Branches.Add(new BranchInfo
+                                {
+                                    Path = branch,
+                                    LastRepositoryVersion = lastRepositoryVersion,
+                                });
                             }
                             else
                             {
-                                Console.WriteLine(string.Format("Build is up to date for {0} - last built version {1} last checkin version {2}", buildDef.Name, latestBuild.SourceVersion, lastRepositoryVersion));
+                                Console.WriteLine($"Build is up to date for {buildDef.Name} (branch {branch}) - last built version {lastBuildVersion} last checkin version {lastRepositoryVersion}");
                             }
                         }
 
+                        if (requiredBuildDetails.Branches.Any())
+                        {
+                            buildIsNeeded.Add(buildOrder, requiredBuildDetails);
+                        }
                     }
-
                 }
-
             }
 
             // now we know what needs to be build, we must trigger any builds...
-            foreach (BuildDefinition buildDef in buildIsNeeded.Values)
+            foreach (RequiredBuildDetails requiredBuild in buildIsNeeded.Values)
             {
-                Console.WriteLine(string.Format("Triggering build for {0}", buildDef.Name));
+                BuildDefinition buildDef = requiredBuild.BuildDef;
 
-                Build build = new Build() { Definition = buildDef, Project = buildDef.Project, Reason = BuildReason.IndividualCI };
-                Task<Build> taskBuild = Task.Run(() => buildClient.QueueBuildAsync(build));
-                taskBuild.Wait();
+                foreach (BranchInfo branch in requiredBuild.Branches)
+                {
+                    Console.WriteLine($"Triggering build for {buildDef.Name} (branch {branch.Path})");
 
-                return true; // ONLY ALLOW **ONE** BUILD PER TIME
+                    Build build = new Build()
+                    {
+                        Definition = buildDef,
+                        Project = buildDef.Project,
+                        Reason = BuildReason.IndividualCI,
+                        SourceBranch = branch.Path,
+                        SourceVersion = branch.LastRepositoryVersion.ToString()
+                    };
+
+                    Task<Build> taskBuild = Task.Run(() => buildClient.QueueBuildAsync(build));
+                    taskBuild.Wait();
+                }
+
+                return true; // ONLY ALLOW BUILDS FROM **ONE** BUILD DEFINITION PER TIME
             }
 
             return false;
-
         }
 
-        private long GetLatestCheckinVersion(string serverUrl, string branch)
+        private List<string> GetBranches(Uri serverUrl, List<string> pathFilters)
         {
             try
             {
-                using (SharpSvn.SvnClient client = new SharpSvn.SvnClient())
+                using (SvnClient client = CreateSvnClient())
                 {
-                    client.Authentication.Clear(); // Clear a previous authentication
-                    client.Authentication.DefaultCredentials = new System.Net.NetworkCredential(svnuser, svnpasssword);
-                    client.Authentication.SslServerTrustHandlers += Authentication_SslServerTrustHandlers;
+                    List<string> branches = new List<string>();
 
-                    SvnInfoEventArgs info;
+                    foreach (string pathFilter in pathFilters.Where(filter => filter[0] == '+'))
+                    {
+                        string filter = pathFilter.Substring(1); // Remove the + from the start
+                        bool isDirectoryFilter = filter.EndsWith("/*") || filter.EndsWith("/");
 
-                    string endpoint = serverUrl.TrimEnd('/') + @"/" + branch;
+                        if (isDirectoryFilter)
+                        {
+                            string baseDirectory = filter.TrimEnd('*');
+                            client.GetList(SvnTarget.FromUri(new Uri(serverUrl, baseDirectory)), out Collection<SvnListEventArgs> svnList);
 
-                    client.GetInfo(endpoint, out info);
+                            IEnumerable<string> relativeDirectoryUris = svnList
+                                .Where(arg => arg.Uri != arg.BaseUri) // Exclude the parent directory
+                                .Where(arg => arg.Entry.NodeKind == SvnNodeKind.Directory) // Only include child directories
+                                .Select(arg => serverUrl.MakeRelativeUri(arg.Uri)) // Get the URI of each directory relative to serverUrl
+                                .Select(uri => uri.ToString().TrimEnd('/')); // Convert each URI to a string and remove the trailing slash
+
+                            branches.AddRange(relativeDirectoryUris);
+                        }
+                        else
+                        {
+                            branches.Add(filter);
+                        }
+                    }
+
+                    foreach (string pathFilter in pathFilters.Where(filter => filter[0] == '-'))
+                    {
+                        string filter = pathFilter.Substring(1); // Remove the - from the start
+                        bool isDirectoryFilter = filter.EndsWith("/*") || filter.EndsWith("/");
+
+                        if (!isDirectoryFilter) // Ignore directory excludes
+                        {
+                            branches.Remove(filter);
+                        }
+                    }
+
+                    return branches;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("EXCEPTION - " + ex.Message);
+                Console.WriteLine(ex.StackTrace);
+                return null;
+            }
+        }
+
+        private long GetLatestCheckinVersion(Uri serverUrl, string branch)
+        {
+            try
+            {
+                using (SvnClient client = CreateSvnClient())
+                {
+                    Uri endpoint = new Uri(serverUrl, branch);
+
+                    client.GetInfo(endpoint, out SvnInfoEventArgs info);
                     long lastRevision = info.LastChangeRevision;
 
                     return lastRevision;
-
                 }
             }
             catch (Exception ex)
@@ -155,14 +248,21 @@ namespace SvnCITrigger
                 Console.WriteLine(ex.StackTrace);
                 return -1;
             }
+        }
 
+        private SvnClient CreateSvnClient()
+        {
+            SvnClient client = new SvnClient();
+            client.Authentication.Clear(); // Clear a previous authentication
+            client.Authentication.DefaultCredentials = new System.Net.NetworkCredential(svnuser, svnpasssword);
+            client.Authentication.SslServerTrustHandlers += Authentication_SslServerTrustHandlers;
+            return client;
         }
 
         private void Authentication_SslServerTrustHandlers(object sender, SharpSvn.Security.SvnSslServerTrustEventArgs e)
         {
             e.AcceptedFailures = e.Failures;
             e.Save = true;
-
         }
     }
 }
