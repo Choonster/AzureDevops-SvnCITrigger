@@ -161,8 +161,10 @@ namespace SvnCITrigger
                         Project = buildDef.Project,
                         Reason = BuildReason.IndividualCI,
                         SourceBranch = branch.Path,
-                        SourceVersion = branch.LastRepositoryVersion.ToString()
+                        SourceVersion = branch.LastRepositoryVersion.ToString(),
                     };
+
+                    build.Tags.Add(branch.Path);
 
                     Task<Build> taskBuild = Task.Run(() => buildClient.QueueBuildAsync(build));
                     taskBuild.Wait();
