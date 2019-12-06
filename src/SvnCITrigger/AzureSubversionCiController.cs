@@ -164,10 +164,11 @@ namespace SvnCITrigger
                         SourceVersion = branch.LastRepositoryVersion.ToString(),
                     };
 
-                    build.Tags.Add(branch.Path);
-
                     Task<Build> taskBuild = Task.Run(() => buildClient.QueueBuildAsync(build));
                     taskBuild.Wait();
+
+                    Task<List<string>> taskTag = Task.Run(() => buildClient.AddBuildTagAsync(projectName, taskBuild.Result.Id, branch.Path));
+                    taskTag.Wait();
                 }
 
                 return true; // ONLY ALLOW BUILDS FROM **ONE** BUILD DEFINITION PER TIME
